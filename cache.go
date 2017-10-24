@@ -144,11 +144,23 @@ type TimestampValue struct {
 	txnID uuid.UUID
 }
 
+func NewTimestampValue(ts hlc.Timestamp, txnID uuid.UUID) TimestampValue {
+	return TimestampValue{ts: ts, txnID: txnID}
+}
+
+func (tv TimestampValue) Ts() hlc.Timestamp { return tv.ts }
+func (tv TimestampValue) TxnID() uuid.UUID  { return tv.txnID }
+
 // New creates a new timestamp cache with the given maximum size.
 func New(size uint32) *Cache {
 	// The earlier and later fixed caches are each 1/2 the size of the larger
 	// cache.
 	return &Cache{size: size, later: newFixedCache(size / 2)}
+}
+
+// SetFloorTS sets the floor timestamp.
+func (c *Cache) SetFloorTS(ts hlc.Timestamp) {
+	c.floorTs = ts
 }
 
 // Add marks the a single key as having been read at the given timestamp. Once
