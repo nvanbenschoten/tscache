@@ -213,13 +213,20 @@ func (c *Cache) LookupTimestamp(key []byte) TimestampValue {
 // specified range. If this operation is repeated with the same range, it will
 // always result in an equal or greater timestamp.
 func (c *Cache) LookupTimestampRange(from, to []byte, opt rangeOptions) TimestampValue {
+	val, _ := c.LookupTimestampRangeWithFlag(from, to, opt)
+	return val
+}
+
+// LookupTimestampRangeWithFlag behaves like LookupTimestampRange, but also returns
+// whether the lookup is returning the floor value.
+func (c *Cache) LookupTimestampRangeWithFlag(from, to []byte, opt rangeOptions) (val TimestampValue, floor bool) {
 	// Acquire the rotation mutex read lock so that the cache will not be rotated
 	// while add or lookup operations are in progress.
 	c.rotMutex.RLock()
 	defer c.rotMutex.RUnlock()
 
 	// First perform lookup on the later cache.
-	val := c.later.lookupTimestampRange(from, to, opt)
+	val = c.later.lookupTimestampRange(from, to, opt)
 
 	// Now perform same lookup on the earlier cache.
 	if c.earlier != nil {
@@ -234,11 +241,11 @@ func (c *Cache) LookupTimestampRange(from, to []byte, opt rangeOptions) Timestam
 
 	// Return the higher timestamp from the two lookups.
 	if !c.floorTs.Less(val.ts) {
-		// TODO return special value for this.
 		val = TimestampValue{ts: c.floorTs, txnID: noTxnID}
+		floor = true
 	}
 
-	return val
+	return val, floor
 }
 
 func (c *Cache) addRange(from, to []byte, opt rangeOptions, val TimestampValue) *fixedCache {
