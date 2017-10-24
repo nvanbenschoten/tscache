@@ -206,13 +206,20 @@ func (c *Cache) AddRange(from, to []byte, opt rangeOptions, val TimestampValue) 
 // If this operation is repeated with the same key, it will always result in an
 // equal or greater timestamp.
 func (c *Cache) LookupTimestamp(key []byte) TimestampValue {
+	return c.LookupTimestampRange(key, key, 0)
+}
+
+// LookupTimestampRange returns the latest timestamp of any key within the
+// specified range. If this operation is repeated with the same range, it will
+// always result in an equal or greater timestamp.
+func (c *Cache) LookupTimestampRange(from, to []byte, opt rangeOptions) TimestampValue {
 	// Acquire the rotation mutex read lock so that the cache will not be rotated
 	// while add or lookup operations are in progress.
 	c.rotMutex.RLock()
 	defer c.rotMutex.RUnlock()
 
 	// First perform lookup on the later cache.
-	val := c.later.lookupTimestamp(key)
+	val := c.later.lookupTimestampRange(from, to, opt)
 
 	// Now perform same lookup on the earlier cache.
 	if c.earlier != nil {
@@ -220,15 +227,13 @@ func (c *Cache) LookupTimestamp(key []byte) TimestampValue {
 		// earlier cache, then no need to do lookup at all.
 		maxTs := hlc.Timestamp{WallTime: atomic.LoadInt64(&c.earlier.maxWallTime)}
 		if val.ts.Less(maxTs) {
-			val2 := c.earlier.lookupTimestamp(key)
-			if val.ts.Less(val2.ts) {
-				val = val2
-			}
+			val2 := c.earlier.lookupTimestampRange(from, to, opt)
+			val, _, _ = ratchetTimestampValue(val, val2)
 		}
 	}
 
 	// Return the higher timestamp from the two lookups.
-	if val.ts.Less(c.floorTs) {
+	if !c.floorTs.Less(val.ts) {
 		// TODO return special value for this.
 		val = TimestampValue{ts: c.floorTs, txnID: noTxnID}
 	}
@@ -333,23 +338,30 @@ func newFixedCache(size uint32) *fixedCache {
 	return &fixedCache{list: arenaskl.NewSkiplist(arenaskl.NewArena(size))}
 }
 
-func (c *fixedCache) lookupTimestamp(key []byte) TimestampValue {
+func (c *fixedCache) lookupTimestampRange(from, to []byte, opt rangeOptions) TimestampValue {
+	if to != nil {
+		cmp := bytes.Compare(from, to)
+		if cmp > 0 {
+			// Starting key is after ending key, so range is zero length.
+			return TimestampValue{}
+		}
+
+		if cmp == 0 {
+			// Starting key is same as ending key.
+			if opt == (ExcludeFrom | ExcludeTo) {
+				// Both from and to keys are excluded, so range is zero length.
+				return TimestampValue{}
+			}
+
+			opt = 0
+		}
+	}
+
 	var it arenaskl.Iterator
 	it.Init(c.list)
 
-	if !it.SeekForPrev(key) {
-		// Key not found, so scan previous nodes to find the gap timestamp.
-		return c.scanForTimestamp(&it, key, false)
-	}
-
-	if (it.Meta() & initializing) != 0 {
-		// Node is not yet initialized, so scan previous nodes to find the
-		// gap timestamp needed to initialize this node.
-		return c.scanForTimestamp(&it, key, true)
-	}
-
-	keyVal, _ := c.decodeTimestampSet(it.Value(), it.Meta())
-	return keyVal
+	onKey := it.SeekForPrev(from)
+	return c.scanForTimestamp(&it, from, to, opt, onKey)
 }
 
 func (c *fixedCache) addNode(it *arenaskl.Iterator, key []byte, val TimestampValue, opt nodeOptions) error {
@@ -368,7 +380,7 @@ func (c *fixedCache) addNode(it *arenaskl.Iterator, key []byte, val TimestampVal
 		// If the previous node has a gap timestamp that is >= than the new
 		// timestamp, then there is no need to add another node, since its
 		// timestamp would be the same as the gap timestamp.
-		prevVal := c.scanForTimestamp(it, key, false)
+		prevVal := c.scanForTimestamp(it, key, key, 0, false)
 		if !prevVal.ts.Less(val.ts) {
 			return nil
 		}
@@ -393,7 +405,7 @@ func (c *fixedCache) addNode(it *arenaskl.Iterator, key []byte, val TimestampVal
 		if err == nil {
 			// Add was successful, so finish initialization by scanning for
 			// gap timestamp and using it to ratchet the new nodes' timestamps.
-			c.scanForTimestamp(it, key, true)
+			c.scanForTimestamp(it, key, key, 0, true)
 			return nil
 		}
 
@@ -571,9 +583,9 @@ func ratchetTimestampValue(old, new TimestampValue) (res TimestampValue, updateV
 //
 // 1. Add new nodes in two phases - initializing and then initialized. Nodes in
 //    the initializing state act as a synchronization point between goroutines
-//    that goroutines that are adding a particular node and goroutines that are
-//    scanning for gap timestamps. Scanning goroutines encounter the initializing
-//    nodes and are forced to deal with them before continuing.
+//    that are adding a particular node and goroutines that are scanning for gap
+//    timestamps. Scanning goroutines encounter the initializing nodes and are
+//    forced to deal with them before continuing.
 //
 // 2. After the gap timestamp of the previous node has been found, the scanning
 //    goroutine will scan forwards until it reaches the original key. It will
@@ -595,7 +607,7 @@ func ratchetTimestampValue(old, new TimestampValue) (res TimestampValue, updateV
 // This means that no matter what gets inserted, or when it gets inserted, the
 // scanning goroutine is guaranteed to end up with a timestamp value that will
 // never decrease on future lookups, which is the critical invariant.
-func (c *fixedCache) scanForTimestamp(it *arenaskl.Iterator, key []byte, onKey bool) TimestampValue {
+func (c *fixedCache) scanForTimestamp(it *arenaskl.Iterator, from, to []byte, opt rangeOptions, onKey bool) TimestampValue {
 	clone := *it
 
 	if onKey {
@@ -628,9 +640,11 @@ func (c *fixedCache) scanForTimestamp(it *arenaskl.Iterator, key []byte, onKey b
 
 	// Now iterate forwards until "key" is reached, update any uninitialized
 	// nodes along the way, and update the gap timestamp.
+	var maxVal TimestampValue
 	for {
 		if !clone.Valid() {
-			return gapVal
+			maxVal, _, _ = ratchetTimestampValue(maxVal, gapVal)
+			return maxVal
 		}
 
 		if (clone.Meta() & initializing) != 0 {
@@ -638,18 +652,37 @@ func (c *fixedCache) scanForTimestamp(it *arenaskl.Iterator, key []byte, onKey b
 			c.ratchetTimestampSet(&clone, gapVal, gapVal, true)
 		}
 
-		cmp := bytes.Compare(clone.Key(), key)
-		if cmp > 0 {
+		toCmp := -1
+		if to != nil {
+			toCmp = bytes.Compare(clone.Key(), to)
+		}
+
+		if toCmp > 0 || (toCmp == 0 && (opt&ExcludeTo) != 0) {
 			// Past the lookup key, so use the gap timestamp.
-			return gapVal
+			maxVal, _, _ = ratchetTimestampValue(maxVal, gapVal)
+			return maxVal
+		}
+
+		fromCmp := bytes.Compare(clone.Key(), from)
+		gapStartAllow := fromCmp > 0
+		gapEndAllow := toCmp < 0
+		if gapStartAllow && gapEndAllow {
+			maxVal, _, _ = ratchetTimestampValue(maxVal, gapVal)
 		}
 
 		var keyVal TimestampValue
 		keyVal, gapVal = c.decodeTimestampSet(clone.Value(), clone.Meta())
 
-		if cmp == 0 {
+		keyStartAllow := fromCmp > 0 || fromCmp == 0 && (opt&ExcludeFrom) == 0
+		keyEndAllow := toCmp <= 0 // && (opt&ExcludeTo) == 0
+
+		if keyStartAllow && keyEndAllow {
+			maxVal, _, _ = ratchetTimestampValue(maxVal, keyVal)
+		}
+
+		if toCmp == 0 {
 			// On the lookup key, so use the key timestamp.
-			return keyVal
+			return maxVal
 		}
 
 		// Haven't yet reached the lookup key, so keep iterating.

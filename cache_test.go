@@ -321,6 +321,56 @@ func TestCacheTxnIDs(t *testing.T) {
 	require.Equal(t, emptyTsVal, c.LookupTimestamp([]byte("watermelon")))
 }
 
+func TestCacheLookupRange(t *testing.T) {
+	tsVal := makeTsVal(hlc.Timestamp{100, 100}, "1")
+	tsVal2 := makeTsVal(hlc.Timestamp{200, 201}, "2")
+	tsVal3 := makeTsVal(hlc.Timestamp{200, 201}, "3") // same ts as tsVal2
+	tsVal3NoTxnID := makeTsValNoTxnID(hlc.Timestamp{200, 201})
+
+	c := New(arenaSize)
+	c.Add([]byte("apricot"), tsVal)
+	require.Equal(t, emptyTsVal, c.LookupTimestamp([]byte("apple")))
+	require.Equal(t, tsVal, c.LookupTimestamp([]byte("apricot")))
+	require.Equal(t, emptyTsVal, c.LookupTimestamp([]byte("banana")))
+
+	c.Add([]byte("banana"), tsVal2)
+	require.Equal(t, emptyTsVal, c.LookupTimestamp([]byte("apple")))
+	require.Equal(t, tsVal, c.LookupTimestamp([]byte("apricot")))
+	require.Equal(t, tsVal2, c.LookupTimestamp([]byte("banana")))
+	require.Equal(t, emptyTsVal, c.LookupTimestamp([]byte("cherry")))
+
+	c.Add([]byte("cherry"), tsVal3)
+	require.Equal(t, emptyTsVal, c.LookupTimestamp([]byte("apple")))
+	require.Equal(t, tsVal, c.LookupTimestamp([]byte("apricot")))
+	require.Equal(t, tsVal2, c.LookupTimestamp([]byte("banana")))
+	require.Equal(t, tsVal3, c.LookupTimestamp([]byte("cherry")))
+
+	require.Equal(t, emptyTsVal, c.LookupTimestampRange([]byte("apple"), []byte("apple"), 0))
+	require.Equal(t, tsVal, c.LookupTimestampRange([]byte("apple"), []byte("apricot"), 0))
+	require.Equal(t, tsVal, c.LookupTimestampRange([]byte("apple"), []byte("apricot"), ExcludeFrom))
+	require.Equal(t, emptyTsVal, c.LookupTimestampRange([]byte("apple"), []byte("apricot"), ExcludeTo))
+
+	require.Equal(t, tsVal, c.LookupTimestampRange([]byte("apricot"), []byte("apricot"), 0))
+	require.Equal(t, tsVal, c.LookupTimestampRange([]byte("apricot"), []byte("apricot"), ExcludeFrom))
+	require.Equal(t, tsVal, c.LookupTimestampRange([]byte("apricot"), []byte("apricot"), ExcludeTo))
+	require.Equal(t, emptyTsVal, c.LookupTimestampRange([]byte("apricot"), []byte("apricot"), (ExcludeFrom|ExcludeTo)))
+
+	require.Equal(t, tsVal2, c.LookupTimestampRange([]byte("apricot"), []byte("banana"), 0))
+	require.Equal(t, tsVal2, c.LookupTimestampRange([]byte("apricot"), []byte("banana"), ExcludeFrom))
+	require.Equal(t, tsVal, c.LookupTimestampRange([]byte("apricot"), []byte("banana"), ExcludeTo))
+	require.Equal(t, emptyTsVal, c.LookupTimestampRange([]byte("apricot"), []byte("banana"), (ExcludeFrom|ExcludeTo)))
+
+	require.Equal(t, tsVal3NoTxnID, c.LookupTimestampRange([]byte("banana"), []byte("cherry"), 0))
+	require.Equal(t, tsVal3, c.LookupTimestampRange([]byte("banana"), []byte("cherry"), ExcludeFrom))
+	require.Equal(t, tsVal2, c.LookupTimestampRange([]byte("banana"), []byte("cherry"), ExcludeTo))
+	require.Equal(t, emptyTsVal, c.LookupTimestampRange([]byte("banana"), []byte("cherry"), (ExcludeFrom|ExcludeTo)))
+
+	require.Equal(t, emptyTsVal, c.LookupTimestampRange([]byte("tomato"), []byte(nil), 0))
+	require.Equal(t, tsVal3, c.LookupTimestampRange([]byte("cherry"), []byte(nil), 0))
+	require.Equal(t, tsVal3NoTxnID, c.LookupTimestampRange([]byte("banana"), []byte(nil), 0))
+	require.Equal(t, tsVal3NoTxnID, c.LookupTimestampRange([]byte("apricot"), []byte(nil), 0))
+}
+
 func TestCacheFillCache(t *testing.T) {
 	const n = 200
 	const txnID = "12"
