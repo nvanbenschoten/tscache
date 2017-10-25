@@ -281,6 +281,9 @@ func TestCacheTxnIDs(t *testing.T) {
 	tsVal3 := makeTsVal(hlc.Timestamp{250, 50}, "2") // same txn ID as tsVal2
 	tsVal4 := makeTsVal(hlc.Timestamp{250, 50}, "3") // same ts as tsVal3
 	tsVal4NoTxnID := makeTsValNoTxnID(hlc.Timestamp{250, 50})
+	tsVal5 := makeTsVal(hlc.Timestamp{350, 50}, "4")
+	tsVal6 := makeTsVal(hlc.Timestamp{350, 50}, "5") // same ts as tsVal3
+	tsVal6NoTxnID := makeTsValNoTxnID(hlc.Timestamp{350, 50})
 
 	c := New(arenaSize)
 
@@ -319,6 +322,22 @@ func TestCacheTxnIDs(t *testing.T) {
 	require.Equal(t, tsVal2NoTxnID, c.LookupTimestamp([]byte("raspberry")))
 	require.Equal(t, tsVal2, c.LookupTimestamp([]byte("tomato")))
 	require.Equal(t, emptyTsVal, c.LookupTimestamp([]byte("watermelon")))
+
+	// Ratchet up the timestamp with a new txnID using ExcludeTo.
+	c.AddRange([]byte("apricot"), []byte("orange"), ExcludeTo, tsVal5)
+	require.Equal(t, emptyTsVal, c.LookupTimestamp([]byte("apple")))
+	require.Equal(t, tsVal5, c.LookupTimestamp([]byte("apricot")))
+	require.Equal(t, tsVal5, c.LookupTimestamp([]byte("banana")))
+	require.Equal(t, tsVal3, c.LookupTimestamp([]byte("orange")))
+	require.Equal(t, tsVal2NoTxnID, c.LookupTimestamp([]byte("raspberry")))
+
+	// Ratchet up the txnID with the same timestamp using ExcludeTo. txnID should be removed.
+	c.AddRange([]byte("apricot"), []byte("banana"), ExcludeTo, tsVal6)
+	require.Equal(t, emptyTsVal, c.LookupTimestamp([]byte("apple")))
+	require.Equal(t, tsVal6NoTxnID, c.LookupTimestamp([]byte("apricot")))
+	require.Equal(t, tsVal5, c.LookupTimestamp([]byte("banana")))
+	require.Equal(t, tsVal3, c.LookupTimestamp([]byte("orange")))
+	require.Equal(t, tsVal2NoTxnID, c.LookupTimestamp([]byte("raspberry")))
 }
 
 func TestCacheLookupRange(t *testing.T) {

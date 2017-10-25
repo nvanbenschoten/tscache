@@ -417,11 +417,12 @@ func (c *fixedCache) addNode(it *arenaskl.Iterator, key []byte, val TimestampVal
 	}
 
 	if !it.SeekForPrev(key) {
-		// If the previous node has a gap timestamp that is >= than the new
-		// timestamp, then there is no need to add another node, since its
-		// timestamp would be the same as the gap timestamp.
+		// If the previous node has a gap value that would not be updated with
+		// the new value, then there is no need to add another node, since its
+		// timestamp would be the same as the gap timestamp and its txnID would
+		// be the same as the gap txnID.
 		prevVal := c.scanForTimestamp(it, key, key, 0, false)
-		if !prevVal.ts.Less(val.ts) {
+		if _, updateVal, _ := ratchetTimestampValue(prevVal, val); !updateVal {
 			return nil
 		}
 
