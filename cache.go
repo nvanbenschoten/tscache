@@ -153,14 +153,35 @@ func (tv TimestampValue) TxnID() uuid.UUID  { return tv.txnID }
 
 // New creates a new timestamp cache with the given maximum size.
 func New(size uint32) *Cache {
-	// The earlier and later fixed caches are each 1/2 the size of the larger
-	// cache.
-	return &Cache{size: size, later: newFixedCache(size / 2)}
+	return NewWithFloor(size, hlc.Timestamp{})
 }
 
-// SetFloorTS sets the floor timestamp.
-func (c *Cache) SetFloorTS(ts hlc.Timestamp) {
-	c.floorTs = ts
+// NewWithFloor creates a new timestamp cache with the given maximum size and
+// the specified floor timestamp.
+func NewWithFloor(size uint32, floor hlc.Timestamp) *Cache {
+	// The earlier and later fixed caches are each 1/2 the size of the larger
+	// cache.
+	return &Cache{
+		size:    size,
+		later:   newFixedCache(size / 2),
+		floorTs: floor,
+	}
+}
+
+// Clear clears the cache and sets a new floor timestamp.
+func (c *Cache) Clear(floor hlc.Timestamp) {
+	c.rotMutex.Lock()
+	defer c.rotMutex.Unlock()
+	c.floorTs = floor
+	c.later = newFixedCache(c.size / 2)
+	c.earlier = nil
+}
+
+// FloorTS returns the floor timestamp.
+func (c *Cache) FloorTS() hlc.Timestamp {
+	c.rotMutex.RLock()
+	defer c.rotMutex.RUnlock()
+	return c.floorTs
 }
 
 // Add marks the a single key as having been read at the given timestamp. Once
