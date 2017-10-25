@@ -601,11 +601,11 @@ func ratchetTimestampValue(old, new TimestampValue) (res TimestampValue, updateV
 		return new, true, true
 	} else if new.ts.Less(old.ts) {
 		return old, false, false
-	} else if new.txnID != old.txnID && old.txnID != noTxnID {
+	} else if new.txnID != old.txnID {
 		// The two values have different transaction IDs but the same timestamp.
 		// We need to remove the transaction ID from the value.
 		new.txnID = noTxnID
-		return new, true, false
+		return new, new != old, false
 	}
 	return new, false, false
 }

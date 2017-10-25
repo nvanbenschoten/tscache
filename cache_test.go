@@ -326,8 +326,12 @@ func TestCacheLookupRange(t *testing.T) {
 	tsVal2 := makeTsVal(hlc.Timestamp{200, 201}, "2")
 	tsVal3 := makeTsVal(hlc.Timestamp{200, 201}, "3") // same ts as tsVal2
 	tsVal3NoTxnID := makeTsValNoTxnID(hlc.Timestamp{200, 201})
+	tsVal4 := makeTsVal(hlc.Timestamp{300, 201}, "4")
+	tsVal5 := makeTsVal(hlc.Timestamp{300, 201}, "5") // same ts as tsVal2
+	tsVal5NoTxnID := makeTsValNoTxnID(hlc.Timestamp{300, 201})
 
 	c := New(arenaSize)
+
 	c.Add([]byte("apricot"), tsVal)
 	require.Equal(t, emptyTsVal, c.LookupTimestamp([]byte("apple")))
 	require.Equal(t, tsVal, c.LookupTimestamp([]byte("apricot")))
@@ -369,6 +373,12 @@ func TestCacheLookupRange(t *testing.T) {
 	require.Equal(t, tsVal3, c.LookupTimestampRange([]byte("cherry"), []byte(nil), 0))
 	require.Equal(t, tsVal3NoTxnID, c.LookupTimestampRange([]byte("banana"), []byte(nil), 0))
 	require.Equal(t, tsVal3NoTxnID, c.LookupTimestampRange([]byte("apricot"), []byte(nil), 0))
+
+	c.AddRange([]byte("apple"), []byte("kiwi"), ExcludeTo, tsVal4)
+	c.AddRange([]byte("kiwi"), []byte("tomato"), ExcludeTo, tsVal5)
+	require.Equal(t, tsVal4, c.LookupTimestampRange([]byte("apple"), []byte("kiwi"), ExcludeTo))
+	require.Equal(t, tsVal5, c.LookupTimestampRange([]byte("kiwi"), []byte("tomato"), ExcludeTo))
+	require.Equal(t, tsVal5NoTxnID, c.LookupTimestampRange([]byte("apple"), []byte("tomato"), ExcludeTo))
 }
 
 func TestCacheFillCache(t *testing.T) {
