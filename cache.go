@@ -24,7 +24,9 @@ import (
 	"sync/atomic"
 
 	"github.com/andy-kimball/arenaskl"
+
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
 
 // RangeOptions are passed to AddRange to indicate the bounds of the range. By
@@ -83,7 +85,9 @@ const (
 )
 
 const (
-	encodedTsSize = 12
+	encodedTsSize    = 12
+	encodedTxnIDSize = 16
+	encodedValSize   = encodedTsSize + encodedTxnIDSize
 )
 
 // FixedCache maintains a skiplist based on a fixed-size arena. When the arena
@@ -131,6 +135,22 @@ type Cache struct {
 	floorTs hlc.Timestamp
 }
 
+// Used when a TimestampValue has no corresponding TxnID.
+var noTxnID uuid.UUID
+
+// TimestampValue combines a timestamp with an optional txn ID.
+type TimestampValue struct {
+	ts    hlc.Timestamp
+	txnID uuid.UUID
+}
+
+func NewTimestampValue(ts hlc.Timestamp, txnID uuid.UUID) TimestampValue {
+	return TimestampValue{ts: ts, txnID: txnID}
+}
+
+func (tv TimestampValue) Ts() hlc.Timestamp { return tv.ts }
+func (tv TimestampValue) TxnID() uuid.UUID  { return tv.txnID }
+
 // New creates a new timestamp cache with the given maximum size.
 func New(size uint32) *Cache {
 	// The earlier and later fixed caches are each 1/2 the size of the larger
@@ -138,11 +158,16 @@ func New(size uint32) *Cache {
 	return &Cache{size: size, later: newFixedCache(size / 2)}
 }
 
+// SetFloorTS sets the floor timestamp.
+func (c *Cache) SetFloorTS(ts hlc.Timestamp) {
+	c.floorTs = ts
+}
+
 // Add marks the a single key as having been read at the given timestamp. Once
 // Add completes, future lookups of this key are guaranteed to return an equal
 // or greater timestamp.
-func (c *Cache) Add(key []byte, ts hlc.Timestamp) {
-	c.AddRange(key, key, 0, ts)
+func (c *Cache) Add(key []byte, val TimestampValue) {
+	c.AddRange(key, key, 0, val)
 }
 
 // AddRange marks the given range of keys (from, to) as having been read at the
@@ -152,7 +177,7 @@ func (c *Cache) Add(key []byte, ts hlc.Timestamp) {
 // of the range are inclusive by default, but can be excluded by passing the
 // applicable range options. Once AddRange completes, future lookups at any point
 // in the range are guaranteed to return an equal or greater timestamp.
-func (c *Cache) AddRange(from, to []byte, opt rangeOptions, ts hlc.Timestamp) {
+func (c *Cache) AddRange(from, to []byte, opt rangeOptions, val TimestampValue) {
 	if from == nil {
 		panic("from key cannot be nil")
 	}
@@ -179,7 +204,7 @@ func (c *Cache) AddRange(from, to []byte, opt rangeOptions, ts hlc.Timestamp) {
 
 	for {
 		// Try to add the range to the later cache.
-		filledCache := c.addRange(from, to, opt, ts)
+		filledCache := c.addRange(from, to, opt, val)
 		if filledCache == nil {
 			break
 		}
@@ -192,37 +217,50 @@ func (c *Cache) AddRange(from, to []byte, opt rangeOptions, ts hlc.Timestamp) {
 // LookupTimestamp returns the latest timestamp at which the given key was read.
 // If this operation is repeated with the same key, it will always result in an
 // equal or greater timestamp.
-func (c *Cache) LookupTimestamp(key []byte) hlc.Timestamp {
+func (c *Cache) LookupTimestamp(key []byte) TimestampValue {
+	return c.LookupTimestampRange(key, key, 0)
+}
+
+// LookupTimestampRange returns the latest timestamp of any key within the
+// specified range. If this operation is repeated with the same range, it will
+// always result in an equal or greater timestamp.
+func (c *Cache) LookupTimestampRange(from, to []byte, opt rangeOptions) TimestampValue {
+	val, _ := c.LookupTimestampRangeWithFlag(from, to, opt)
+	return val
+}
+
+// LookupTimestampRangeWithFlag behaves like LookupTimestampRange, but also returns
+// whether the lookup is returning the floor value.
+func (c *Cache) LookupTimestampRangeWithFlag(from, to []byte, opt rangeOptions) (val TimestampValue, floor bool) {
 	// Acquire the rotation mutex read lock so that the cache will not be rotated
 	// while add or lookup operations are in progress.
 	c.rotMutex.RLock()
 	defer c.rotMutex.RUnlock()
 
 	// First perform lookup on the later cache.
-	ts := c.later.lookupTimestamp(key)
+	val = c.later.lookupTimestampRange(from, to, opt)
 
 	// Now perform same lookup on the earlier cache.
 	if c.earlier != nil {
 		// If later cache timestamp is greater than the max timestamp in the
 		// earlier cache, then no need to do lookup at all.
 		maxTs := hlc.Timestamp{WallTime: atomic.LoadInt64(&c.earlier.maxWallTime)}
-		if ts.Less(maxTs) {
-			ts2 := c.earlier.lookupTimestamp(key)
-			if ts.Less(ts2) {
-				ts = ts2
-			}
+		if val.ts.Less(maxTs) {
+			val2 := c.earlier.lookupTimestampRange(from, to, opt)
+			val, _, _ = ratchetTimestampValue(val, val2)
 		}
 	}
 
 	// Return the higher timestamp from the two lookups.
-	if ts.Less(c.floorTs) {
-		ts = c.floorTs
+	if !c.floorTs.Less(val.ts) {
+		val = TimestampValue{ts: c.floorTs, txnID: noTxnID}
+		floor = true
 	}
 
-	return ts
+	return val, floor
 }
 
-func (c *Cache) addRange(from, to []byte, opt rangeOptions, ts hlc.Timestamp) *fixedCache {
+func (c *Cache) addRange(from, to []byte, opt rangeOptions, val TimestampValue) *fixedCache {
 	// Acquire the rotation mutex read lock so that the cache will not be rotated
 	// while add or lookup operations are in progress.
 	c.rotMutex.RLock()
@@ -230,7 +268,7 @@ func (c *Cache) addRange(from, to []byte, opt rangeOptions, ts hlc.Timestamp) *f
 
 	// If floor ts is >= requested timestamp, then no need to perform a search
 	// or add any records.
-	if !c.floorTs.Less(ts) {
+	if !c.floorTs.Less(val.ts) {
 		return nil
 	}
 
@@ -244,9 +282,9 @@ func (c *Cache) addRange(from, to []byte, opt rangeOptions, ts hlc.Timestamp) *f
 	var err error
 	if to != nil {
 		if (opt & ExcludeTo) == 0 {
-			err = c.later.addNode(&it, to, ts, hasKey)
+			err = c.later.addNode(&it, to, val, hasKey)
 		} else {
-			err = c.later.addNode(&it, to, ts, 0)
+			err = c.later.addNode(&it, to, val, 0)
 		}
 
 		if err == arenaskl.ErrArenaFull {
@@ -261,9 +299,9 @@ func (c *Cache) addRange(from, to []byte, opt rangeOptions, ts hlc.Timestamp) *f
 
 	// Ensure that the starting node has been created.
 	if (opt & ExcludeFrom) == 0 {
-		err = c.later.addNode(&it, from, ts, hasKey|hasGap)
+		err = c.later.addNode(&it, from, val, hasKey|hasGap)
 	} else {
-		err = c.later.addNode(&it, from, ts, hasGap)
+		err = c.later.addNode(&it, from, val, hasGap)
 	}
 
 	if err == arenaskl.ErrArenaFull {
@@ -281,7 +319,7 @@ func (c *Cache) addRange(from, to []byte, opt rangeOptions, ts hlc.Timestamp) *f
 
 	// Now iterate forwards and ensure that all nodes between the start and
 	// end (exclusive) have timestamps that are >= the range timestamp.
-	if !c.later.ensureFloorTs(&it, to, ts) {
+	if !c.later.ensureFloorTs(&it, to, val) {
 		// Cache is filled up, so rotate caches and try again.
 		return c.later
 	}
@@ -319,48 +357,55 @@ func newFixedCache(size uint32) *fixedCache {
 	return &fixedCache{list: arenaskl.NewSkiplist(arenaskl.NewArena(size))}
 }
 
-func (c *fixedCache) lookupTimestamp(key []byte) hlc.Timestamp {
+func (c *fixedCache) lookupTimestampRange(from, to []byte, opt rangeOptions) TimestampValue {
+	if to != nil {
+		cmp := bytes.Compare(from, to)
+		if cmp > 0 {
+			// Starting key is after ending key, so range is zero length.
+			return TimestampValue{}
+		}
+
+		if cmp == 0 {
+			// Starting key is same as ending key.
+			if opt == (ExcludeFrom | ExcludeTo) {
+				// Both from and to keys are excluded, so range is zero length.
+				return TimestampValue{}
+			}
+
+			opt = 0
+		}
+	}
+
 	var it arenaskl.Iterator
 	it.Init(c.list)
 
-	if !it.SeekForPrev(key) {
-		// Key not found, so scan previous nodes to find the gap timestamp.
-		return c.scanForTimestamp(&it, key, false)
-	}
-
-	if (it.Meta() & initializing) != 0 {
-		// Node is not yet initialized, so scan previous nodes to find the
-		// gap timestamp needed to initialize this node.
-		return c.scanForTimestamp(&it, key, true)
-	}
-
-	keyTs, _ := c.decodeTimestampSet(it.Value(), it.Meta())
-	return keyTs
+	onKey := it.SeekForPrev(from)
+	return c.scanForTimestamp(&it, from, to, opt, onKey)
 }
 
-func (c *fixedCache) addNode(it *arenaskl.Iterator, key []byte, ts hlc.Timestamp, opt nodeOptions) error {
-	var arr [encodedTsSize * 2]byte
-	var keyTs, gapTs hlc.Timestamp
+func (c *fixedCache) addNode(it *arenaskl.Iterator, key []byte, val TimestampValue, opt nodeOptions) error {
+	var arr [encodedValSize * 2]byte
+	var keyVal, gapVal TimestampValue
 
 	if (opt & hasKey) != 0 {
-		keyTs = ts
+		keyVal = val
 	}
 
 	if (opt & hasGap) != 0 {
-		gapTs = ts
+		gapVal = val
 	}
 
 	if !it.SeekForPrev(key) {
 		// If the previous node has a gap timestamp that is >= than the new
 		// timestamp, then there is no need to add another node, since its
 		// timestamp would be the same as the gap timestamp.
-		prevTs := c.scanForTimestamp(it, key, false)
-		if !prevTs.Less(ts) {
+		prevVal := c.scanForTimestamp(it, key, key, 0, false)
+		if !prevVal.ts.Less(val.ts) {
 			return nil
 		}
 
 		// Ratchet max timestamp before adding the node.
-		c.ratchetMaxTimestamp(ts)
+		c.ratchetMaxTimestamp(val.ts)
 
 		// Ensure that a new node is created. It needs to stay in the
 		// initializing state until the gap timestamp of its preceding node
@@ -369,7 +414,7 @@ func (c *fixedCache) addNode(it *arenaskl.Iterator, key []byte, ts hlc.Timestamp
 		// for other ongoing operations - when they see this node they're
 		// forced to stop and help complete its initialization before they
 		// can continue.
-		b, meta := c.encodeTimestampSet(arr[:0], keyTs, gapTs)
+		b, meta := c.encodeTimestampSet(arr[:0], keyVal, gapVal)
 		err := it.Add(key, b, meta|initializing)
 		if err == arenaskl.ErrArenaFull {
 			atomic.StoreInt32(&c.isFull, 1)
@@ -379,7 +424,7 @@ func (c *fixedCache) addNode(it *arenaskl.Iterator, key []byte, ts hlc.Timestamp
 		if err == nil {
 			// Add was successful, so finish initialization by scanning for
 			// gap timestamp and using it to ratchet the new nodes' timestamps.
-			c.scanForTimestamp(it, key, true)
+			c.scanForTimestamp(it, key, key, 0, true)
 			return nil
 		}
 
@@ -396,12 +441,12 @@ func (c *fixedCache) addNode(it *arenaskl.Iterator, key []byte, ts hlc.Timestamp
 	// initializing bit, since we don't have the gap timestamp from the previous
 	// node. Leave finishing initialization to the thread that added the node, or
 	// to a lookup thread that requires it.
-	c.ratchetTimestampSet(it, keyTs, gapTs, false)
+	c.ratchetTimestampSet(it, keyVal, gapVal, false)
 
 	return nil
 }
 
-func (c *fixedCache) ensureFloorTs(it *arenaskl.Iterator, to []byte, ts hlc.Timestamp) bool {
+func (c *fixedCache) ensureFloorTs(it *arenaskl.Iterator, to []byte, val TimestampValue) bool {
 	for it.Valid() {
 		if to != nil && bytes.Compare(it.Key(), to) >= 0 {
 			break
@@ -419,7 +464,7 @@ func (c *fixedCache) ensureFloorTs(it *arenaskl.Iterator, to []byte, ts hlc.Time
 		// Don't clear the initialization bit, since we don't have the gap
 		// timestamp from the previous node, and don't need an initialized node
 		// for this operation anyway.
-		c.ratchetTimestampSet(it, ts, ts, false)
+		c.ratchetTimestampSet(it, val, val, false)
 
 		it.Next()
 	}
@@ -451,25 +496,21 @@ func (c *fixedCache) ratchetMaxTimestamp(ts hlc.Timestamp) {
 // the maximum of their current values or the given values. If clearInit is true,
 // then the initializing bit will be cleared, indicating that the node is now
 // fully initialized and its timestamps can now be relied upon.
-func (c *fixedCache) ratchetTimestampSet(it *arenaskl.Iterator, keyTs, gapTs hlc.Timestamp, clearInit bool) {
-	var arr [encodedTsSize * 2]byte
+func (c *fixedCache) ratchetTimestampSet(it *arenaskl.Iterator, keyVal, gapVal TimestampValue, clearInit bool) {
+	var arr [encodedValSize * 2]byte
 
 	for {
 		meta := it.Meta()
-		oldKeyTs, oldGapTs := c.decodeTimestampSet(it.Value(), meta)
+		oldKeyVal, oldGapVal := c.decodeTimestampSet(it.Value(), meta)
 
-		greater := false
-		if oldKeyTs.Less(keyTs) {
-			greater = true
-		} else {
-			keyTs = oldKeyTs
-		}
+		keyUpdateVal, keyUpdateTs := false, false
+		keyVal, keyUpdateVal, keyUpdateTs = ratchetTimestampValue(oldKeyVal, keyVal)
 
-		if oldGapTs.Less(gapTs) {
-			greater = true
-		} else {
-			gapTs = oldGapTs
-		}
+		gapUpdateVal, gapUpdateTs := false, false
+		gapVal, gapUpdateVal, gapUpdateTs = ratchetTimestampValue(oldGapVal, gapVal)
+
+		updateVal := keyUpdateVal || gapUpdateVal
+		updateTs := keyUpdateTs || gapUpdateTs
 
 		var initMeta uint16
 		if clearInit {
@@ -480,7 +521,7 @@ func (c *fixedCache) ratchetTimestampSet(it *arenaskl.Iterator, keyTs, gapTs hlc
 
 		// Check whether it's necessary to make an update.
 		var err error
-		if !greater {
+		if !updateVal {
 			if !clearInit || (meta&initializing) == 0 {
 				// No update necessary because the init bit doesn't need to be
 				// cleared or it's already cleared.
@@ -491,14 +532,17 @@ func (c *fixedCache) ratchetTimestampSet(it *arenaskl.Iterator, keyTs, gapTs hlc
 			err = it.SetMeta(meta & ^uint16(initializing))
 		} else {
 			// Ratchet the max timestamp.
-			if gapTs.Less(keyTs) {
-				c.ratchetMaxTimestamp(keyTs)
-			} else {
-				c.ratchetMaxTimestamp(gapTs)
+			if updateTs {
+				keyTs, gapTs := keyVal.ts, gapVal.ts
+				if gapTs.Less(keyTs) {
+					c.ratchetMaxTimestamp(keyTs)
+				} else {
+					c.ratchetMaxTimestamp(gapTs)
+				}
 			}
 
 			// Update the timestamps, possibly preserving the init bit.
-			b, newMeta := c.encodeTimestampSet(arr[:0], keyTs, gapTs)
+			b, newMeta := c.encodeTimestampSet(arr[:0], keyVal, gapVal)
 			err = it.Set(b, newMeta|initMeta)
 		}
 
@@ -527,6 +571,24 @@ func (c *fixedCache) ratchetTimestampSet(it *arenaskl.Iterator, keyTs, gapTs hlc
 	}
 }
 
+// ratchetTimestampValue returns the TimestampValue that results from ratchetting
+// the provided old and new TimestampValues. It also returns flags describing
+// whether the value was updated and whether the timestamp within the value
+// was updated.
+func ratchetTimestampValue(old, new TimestampValue) (res TimestampValue, updateVal, updateTs bool) {
+	if old.ts.Less(new.ts) {
+		return new, true, true
+	} else if new.ts.Less(old.ts) {
+		return old, false, false
+	} else if new.txnID != old.txnID && old.txnID != noTxnID {
+		// The two values have different transaction IDs but the same timestamp.
+		// We need to remove the transaction ID from the value.
+		new.txnID = noTxnID
+		return new, true, false
+	}
+	return new, false, false
+}
+
 // ScanForTimestamp scans backwards for the first initialized node and uses its
 // gap timestamp as the initial candidate. It then scans forwards until it
 // reaches the termination key, ratcheting any uninitialized nodes it encounters,
@@ -540,9 +602,9 @@ func (c *fixedCache) ratchetTimestampSet(it *arenaskl.Iterator, keyTs, gapTs hlc
 //
 // 1. Add new nodes in two phases - initializing and then initialized. Nodes in
 //    the initializing state act as a synchronization point between goroutines
-//    that goroutines that are adding a particular node and goroutines that are
-//    scanning for gap timestamps. Scanning goroutines encounter the initializing
-//    nodes and are forced to deal with them before continuing.
+//    that are adding a particular node and goroutines that are scanning for gap
+//    timestamps. Scanning goroutines encounter the initializing nodes and are
+//    forced to deal with them before continuing.
 //
 // 2. After the gap timestamp of the previous node has been found, the scanning
 //    goroutine will scan forwards until it reaches the original key. It will
@@ -564,7 +626,7 @@ func (c *fixedCache) ratchetTimestampSet(it *arenaskl.Iterator, keyTs, gapTs hlc
 // This means that no matter what gets inserted, or when it gets inserted, the
 // scanning goroutine is guaranteed to end up with a timestamp value that will
 // never decrease on future lookups, which is the critical invariant.
-func (c *fixedCache) scanForTimestamp(it *arenaskl.Iterator, key []byte, onKey bool) hlc.Timestamp {
+func (c *fixedCache) scanForTimestamp(it *arenaskl.Iterator, from, to []byte, opt rangeOptions, onKey bool) TimestampValue {
 	clone := *it
 
 	if onKey {
@@ -575,7 +637,7 @@ func (c *fixedCache) scanForTimestamp(it *arenaskl.Iterator, key []byte, onKey b
 
 	// First iterate backwards, looking for an already initialized node which
 	// will supply the initial candidate gap timestamp.
-	var gapTs hlc.Timestamp
+	var gapVal TimestampValue
 	for {
 		if !clone.Valid() {
 			// No more previous nodes, so use the zero timestamp and begin
@@ -587,7 +649,7 @@ func (c *fixedCache) scanForTimestamp(it *arenaskl.Iterator, key []byte, onKey b
 		meta := clone.Meta()
 		if (meta & initializing) == 0 {
 			// Found the gap timestamp for an initialized node.
-			_, gapTs = c.decodeTimestampSet(clone.Value(), meta)
+			_, gapVal = c.decodeTimestampSet(clone.Value(), meta)
 			clone.Next()
 			break
 		}
@@ -597,28 +659,49 @@ func (c *fixedCache) scanForTimestamp(it *arenaskl.Iterator, key []byte, onKey b
 
 	// Now iterate forwards until "key" is reached, update any uninitialized
 	// nodes along the way, and update the gap timestamp.
+	var maxVal TimestampValue
 	for {
 		if !clone.Valid() {
-			return gapTs
+			maxVal, _, _ = ratchetTimestampValue(maxVal, gapVal)
+			return maxVal
 		}
 
 		if (clone.Meta() & initializing) != 0 {
 			// Finish initializing the node with the gap timestamp.
-			c.ratchetTimestampSet(&clone, gapTs, gapTs, true)
+			c.ratchetTimestampSet(&clone, gapVal, gapVal, true)
 		}
 
-		cmp := bytes.Compare(clone.Key(), key)
-		if cmp > 0 {
+		toCmp := -1
+		if to != nil {
+			toCmp = bytes.Compare(clone.Key(), to)
+		}
+
+		if toCmp > 0 || (toCmp == 0 && (opt&ExcludeTo) != 0) {
 			// Past the lookup key, so use the gap timestamp.
-			return gapTs
+			maxVal, _, _ = ratchetTimestampValue(maxVal, gapVal)
+			return maxVal
 		}
 
-		var keyTs hlc.Timestamp
-		keyTs, gapTs = c.decodeTimestampSet(clone.Value(), clone.Meta())
+		fromCmp := bytes.Compare(clone.Key(), from)
+		gapStartAllow := fromCmp > 0
+		gapEndAllow := toCmp < 0
+		if gapStartAllow && gapEndAllow {
+			maxVal, _, _ = ratchetTimestampValue(maxVal, gapVal)
+		}
 
-		if cmp == 0 {
+		var keyVal TimestampValue
+		keyVal, gapVal = c.decodeTimestampSet(clone.Value(), clone.Meta())
+
+		keyStartAllow := fromCmp > 0 || fromCmp == 0 && (opt&ExcludeFrom) == 0
+		keyEndAllow := toCmp <= 0 // && (opt&ExcludeTo) == 0
+
+		if keyStartAllow && keyEndAllow {
+			maxVal, _, _ = ratchetTimestampValue(maxVal, keyVal)
+		}
+
+		if toCmp == 0 {
 			// On the lookup key, so use the key timestamp.
-			return keyTs
+			return maxVal
 		}
 
 		// Haven't yet reached the lookup key, so keep iterating.
@@ -626,31 +709,32 @@ func (c *fixedCache) scanForTimestamp(it *arenaskl.Iterator, key []byte, onKey b
 	}
 }
 
-func (c *fixedCache) decodeTimestampSet(b []byte, meta uint16) (keyTs, gapTs hlc.Timestamp) {
+func (c *fixedCache) decodeTimestampSet(b []byte, meta uint16) (keyVal, gapVal TimestampValue) {
 	if (meta & useMaxTs) != 0 {
 		ts := hlc.Timestamp{WallTime: atomic.LoadInt64(&c.maxWallTime)}
-		return ts, ts
+		maxVal := TimestampValue{ts: ts, txnID: noTxnID}
+		return maxVal, maxVal
 	}
 
 	if (meta & hasKey) != 0 {
-		b, keyTs = decodeTimestamp(b)
+		b, keyVal = decodeTimestamp(b)
 	}
 
 	if (meta & hasGap) != 0 {
-		b, gapTs = decodeTimestamp(b)
+		b, gapVal = decodeTimestamp(b)
 	}
 
 	return
 }
 
-func (c *fixedCache) encodeTimestampSet(b []byte, keyTs, gapTs hlc.Timestamp) (ret []byte, meta uint16) {
-	if keyTs.WallTime != 0 || keyTs.Logical != 0 {
-		b = encodeTimestamp(b, keyTs)
+func (c *fixedCache) encodeTimestampSet(b []byte, keyVal, gapVal TimestampValue) (ret []byte, meta uint16) {
+	if keyTs := keyVal.ts; keyTs.WallTime != 0 || keyTs.Logical != 0 {
+		b = encodeTimestamp(b, keyVal)
 		meta |= hasKey
 	}
 
-	if gapTs.WallTime != 0 || gapTs.Logical != 0 {
-		b = encodeTimestamp(b, gapTs)
+	if gapTs := gapVal.ts; gapTs.WallTime != 0 || gapTs.Logical != 0 {
+		b = encodeTimestamp(b, gapVal)
 		meta |= hasGap
 	}
 
@@ -658,18 +742,24 @@ func (c *fixedCache) encodeTimestampSet(b []byte, keyTs, gapTs hlc.Timestamp) (r
 	return
 }
 
-func decodeTimestamp(b []byte) (ret []byte, ts hlc.Timestamp) {
+func decodeTimestamp(b []byte) (ret []byte, val TimestampValue) {
 	wallTime := binary.BigEndian.Uint64(b)
 	logical := binary.BigEndian.Uint32(b[8:])
-	ts = hlc.Timestamp{WallTime: int64(wallTime), Logical: int32(logical)}
-	ret = b[encodedTsSize:]
+	val.ts = hlc.Timestamp{WallTime: int64(wallTime), Logical: int32(logical)}
+	if err := val.txnID.Unmarshal(b[encodedTsSize:encodedValSize]); err != nil {
+		panic(err)
+	}
+	ret = b[encodedValSize:]
 	return
 }
 
-func encodeTimestamp(b []byte, ts hlc.Timestamp) []byte {
+func encodeTimestamp(b []byte, val TimestampValue) []byte {
 	l := len(b)
-	b = b[:l+encodedTsSize]
-	binary.BigEndian.PutUint64(b[l:], uint64(ts.WallTime))
-	binary.BigEndian.PutUint32(b[l+8:], uint32(ts.Logical))
+	b = b[:l+encodedValSize]
+	binary.BigEndian.PutUint64(b[l:], uint64(val.ts.WallTime))
+	binary.BigEndian.PutUint32(b[l+8:], uint32(val.ts.Logical))
+	if _, err := val.txnID.MarshalTo(b[l+encodedTsSize:]); err != nil {
+		panic(err)
+	}
 	return b
 }
